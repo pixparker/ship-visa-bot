@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./output:/app/output
+      - ./documents/templates:/app/documents/templates
+    restart: unless-stopped
+
+  # Optional: use Gotenberg for more reliable DOCX→PDF conversion
+  # Uncomment and set GOTENBERG_URL=http://gotenberg:3000 in .env
+  # gotenberg:
+  #   image: gotenberg/gotenberg:8
+  #   restart: unless-stopped
