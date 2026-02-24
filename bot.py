@@ -139,8 +139,17 @@ async def _cancel(update, ctx) -> int:
 
 def main() -> None:
     builder = Application.builder().token(BOT_TOKEN)
-    if PROXY_URL:
+
+    sandbox_mode = os.getenv("SANDBOX_MODE")
+    sandbox_port = os.getenv("SANDBOX_PORT", "8888")
+
+    if sandbox_mode:
+        base = f"http://127.0.0.1:{sandbox_port}/bot"
+        builder = builder.base_url(base).base_file_url(f"http://127.0.0.1:{sandbox_port}/file/bot")
+        logger.info("🔧 SANDBOX MODE – fake API at %s", base)
+    elif PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
+
     app = builder.build()
     app.add_handler(TypeHandler(Update, _log_update), group=-1)
     app.add_handler(build_conversation_handler())

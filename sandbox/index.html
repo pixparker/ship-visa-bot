@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bot Sandbox</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:          #0f1117;
+    --surface:     #1a1d27;
+    --surface2:    #22263a;
+    --border:      #2d3145;
+    --accent:      #5865f2;
+    --accent-dim:  #3b43aa;
+    --green:       #3ba55c;
+    --red:         #ed4245;
+    --yellow:      #faa81a;
+    --text:        #e0e2ef;
+    --text-muted:  #7a7f9a;
+    --bot-bubble:  #22263a;
+    --user-bubble: #5865f2;
+    --font-mono:   "SF Mono", "Fira Code", Consolas, monospace;
+    --radius:      12px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Top bar ── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  header .logo { font-size: 22px; }
+  header h1 { font-size: 15px; font-weight: 700; letter-spacing: .5px; }
+  header .sub { font-size: 12px; color: var(--text-muted); }
+  header .spacer { flex: 1; }
+  .status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: #888; transition: background .3s;
+  }
+  .status-dot.online  { background: var(--green); }
+  .status-dot.offline { background: var(--red);   }
+  header .status-label { font-size: 12px; color: var(--text-muted); }
+
+  /* ── Main layout ── */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── Chat panel ── */
+  .chat-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    border-right: 1px solid var(--border);
+  }
+
+  .chat-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .chat-toolbar span { font-size: 13px; color: var(--text-muted); }
+  .cmd-btn {
+    padding: 5px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .cmd-btn:hover { background: var(--border); border-color: var(--accent); }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    scroll-behavior: smooth;
+  }
+
+  /* ── Bubbles ── */
+  .bubble-row {
+    display: flex;
+    gap: 10px;
+    max-width: 88%;
+  }
+  .bubble-row.user { align-self: flex-end; flex-direction: row-reverse; }
+  .bubble-row.bot  { align-self: flex-start; }
+
+  .avatar {
+    width: 32px; height: 32px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; flex-shrink: 0;
+    background: var(--surface2);
+  }
+  .bubble-row.user .avatar { background: var(--accent-dim); }
+
+  .bubble-content { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+  .bubble {
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    font-size: 14px;
+    line-height: 1.55;
+    word-break: break-word;
+    white-space: pre-wrap;
+    position: relative;
+  }
+  .bubble-row.bot  .bubble { background: var(--bot-bubble);  border-bottom-left-radius: 4px; }
+  .bubble-row.user .bubble { background: var(--user-bubble); border-bottom-right-radius: 4px; color: #fff; }
+
+  .bubble .ts {
+    font-size: 10px;
+    color: rgba(255,255,255,.35);
+    margin-top: 4px;
+    text-align: right;
+  }
+  .bubble-row.bot .bubble .ts { color: var(--text-muted); }
+
+  /* command bubble */
+  .bubble-row.user.cmd .bubble { background: var(--accent-dim); font-family: var(--font-mono); }
+
+  /* ── Inline keyboard ── */
+  .keyboard { display: flex; flex-direction: column; gap: 5px; }
+  .keyboard-row { display: flex; gap: 5px; }
+  .kb-btn {
+    flex: 1;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .15s, color .15s;
+    text-align: center;
+    direction: rtl;
+  }
+  .kb-btn:hover:not(:disabled) { background: var(--accent); color: #fff; }
+  .kb-btn:disabled {
+    border-color: var(--border);
+    color: var(--text-muted);
+    cursor: default;
+    opacity: .6;
+  }
+
+  /* ── File card ── */
+  .file-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    text-decoration: none;
+    color: var(--text);
+    transition: border-color .15s;
+  }
+  .file-card:hover { border-color: var(--accent); }
+  .file-card .file-icon { font-size: 24px; }
+  .file-card .file-info { min-width: 0; }
+  .file-card .file-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-card .file-meta { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+  .file-card .dl-icon { margin-left: auto; font-size: 18px; color: var(--accent); }
+
+  /* ── Input area ── */
+  .input-area {
+    padding: 12px 14px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    flex-shrink: 0;
+  }
+  #msgInput {
+    flex: 1;
+    padding: 10px 14px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    resize: none;
+    min-height: 42px;
+    max-height: 120px;
+    outline: none;
+    transition: border-color .15s;
+    font-family: inherit;
+  }
+  #msgInput:focus { border-color: var(--accent); }
+  #msgInput::placeholder { color: var(--text-muted); }
+
+  #sendBtn {
+    padding: 10px 18px;
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .15s;
+    white-space: nowrap;
+  }
+  #sendBtn:hover { background: var(--accent-dim); }
+  #sendBtn:disabled { opacity: .5; cursor: default; }
+
+  /* ── Log panel ── */
+  .log-panel {
+    width: 340px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+  }
+
+  .log-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .8px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .log-header button {
+    font-size: 11px;
+    padding: 3px 9px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: none;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .log-header button:hover { border-color: var(--text-muted); color: var(--text); }
+
+  #logList {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  .log-entry {
+    padding: 4px 14px;
+    line-height: 1.5;
+    border-left: 2px solid transparent;
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+  }
+  .log-entry.info    { border-color: var(--accent); color: #9aa5f5; }
+  .log-entry.success { border-color: var(--green);  color: #6ac97a; }
+  .log-entry.error   { border-color: var(--red);    color: #f06060; }
+  .log-entry.debug   { border-color: var(--border); color: var(--text-muted); }
+
+  .log-entry .log-ts { color: var(--text-muted); flex-shrink: 0; font-size: 10px; }
+  .log-entry .log-msg { word-break: break-word; }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar       { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 9px; }
+
+  /* ── Typing indicator ── */
+  .typing { display: none; align-self: flex-start; padding: 8px 14px; background: var(--bot-bubble); border-radius: var(--radius); border-bottom-left-radius: 4px; }
+  .typing span { display: inline-block; width: 6px; height: 6px; margin: 0 2px; border-radius: 50%; background: var(--text-muted); animation: bounce .9s infinite; }
+  .typing span:nth-child(2) { animation-delay: .15s; }
+  .typing span:nth-child(3) { animation-delay: .30s; }
+  @keyframes bounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+</style>
+</head>
+<body>
+
+<!-- ── Header ───────────────────────────────────────────────────────────────── -->
+<header>
+  <div class="logo">🤖</div>
+  <div>
+    <h1>Bot Sandbox</h1>
+    <div class="sub">Local testing — no Telegram required</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="status-dot" id="statusDot"></div>
+  <div class="status-label" id="statusLabel">Connecting…</div>
+</header>
+
+<!-- ── Main ─────────────────────────────────────────────────────────────────── -->
+<div class="main">
+
+  <!-- Chat panel -->
+  <div class="chat-panel">
+    <div class="chat-toolbar">
+      <span>Commands:</span>
+      <button class="cmd-btn" onclick="sendCommand('/start')">⟳ /start</button>
+      <button class="cmd-btn" onclick="sendCommand('/cancel')">✕ /cancel</button>
+      <div style="flex:1"></div>
+      <button class="cmd-btn" onclick="clearChat()" title="Clear chat history">🗑 Clear chat</button>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="typing" id="typing">
+        <span></span><span></span><span></span>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <textarea
+        id="msgInput"
+        placeholder="Type a message and press Enter (Shift+Enter for new line)…"
+        rows="1"
+      ></textarea>
+      <button id="sendBtn" onclick="sendMessage()">Send ↑</button>
+    </div>
+  </div>
+
+  <!-- Log panel -->
+  <div class="log-panel">
+    <div class="log-header">
+      <span>Processing Logs</span>
+      <button onclick="clearLogs()">Clear</button>
+    </div>
+    <div id="logList"></div>
+  </div>
+
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let ws = null;
+let connected = false;
+// Track message DOM nodes by message_id so we can update/disable them
+const messageMap = {};  // message_id → { row, keyboard_div }
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/sandbox/ws`);
+
+  ws.onopen = () => {
+    setStatus(true);
+  };
+
+  ws.onmessage = (ev) => {
+    const event = JSON.parse(ev.data);
+    handleEvent(event);
+  };
+
+  ws.onclose = () => {
+    setStatus(false);
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+function setStatus(online) {
+  connected = online;
+  document.getElementById('statusDot').className = 'status-dot ' + (online ? 'online' : 'offline');
+  document.getElementById('statusLabel').textContent = online ? 'Connected' : 'Reconnecting…';
+  document.getElementById('sendBtn').disabled = !online;
+}
+
+// ── Event router ───────────────────────────────────────────────────────────
+function handleEvent(ev) {
+  switch (ev.type) {
+    case 'connected':      break;
+    case 'log':            addLog(ev.level, ev.message); break;
+    case 'user_message':   addUserBubble(ev.text, ev.is_command); break;
+    case 'user_button_click': addUserBubble(`[${ev.button_text}]`, false, true); break;
+    case 'bot_message':    addBotBubble(ev); break;
+    case 'bot_edit_message': editBotBubble(ev); break;
+    case 'bot_edit_keyboard': editKeyboard(ev); break;
+    case 'bot_document':   addDocumentBubble(ev); break;
+  }
+}
+
+// ── Time helper ───────────────────────────────────────────────────────────
+function ts() {
+  return new Date().toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
+
+// ── Chat rendering ─────────────────────────────────────────────────────────
+function scrollToBottom() {
+  const m = document.getElementById('messages');
+  m.scrollTop = m.scrollHeight;
+}
+
+function addUserBubble(text, isCommand = false, isButton = false) {
+  const messages = document.getElementById('messages');
+  const row = document.createElement('div');
+  row.className = 'bubble-row user' + (isCommand ? ' cmd' : '');
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = isButton ? '🖱' : '🙋';
+
+  const content = document.createElement('div');
+  content.className = 'bubble-content';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = escapeHtml(text) + `<div class="ts">${ts()}</div>`;
+
+  content.appendChild(bubble);
+  row.appendChild(avatar);
+  row.appendChild(content);
+  messages.insertBefore(row, document.getElementById('typing'));
+  scrollToBottom();
+}
+
+function addBotBubble(ev) {
+  const messages = document.getElementById('messages');
+  const row = document.createElement('div');
+  row.className = 'bubble-row bot';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = '🤖';
+
+  const content = document.createElement('div');
+  content.className = 'bubble-content';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = renderText(ev.text) + `<div class="ts">${ts()}</div>`;
+  content.appendChild(bubble);
+
+  let keyboardDiv = null;
+  if (ev.reply_markup && ev.reply_markup.inline_keyboard) {
+    keyboardDiv = renderKeyboard(ev.reply_markup.inline_keyboard, ev.message_id);
+    content.appendChild(keyboardDiv);
+  }
+
+  row.appendChild(avatar);
+  row.appendChild(content);
+  messages.insertBefore(row, document.getElementById('typing'));
+
+  if (ev.message_id) {
+    messageMap[ev.message_id] = { row, bubble, content, keyboardDiv };
+  }
+
+  scrollToBottom();
+}
+
+function editBotBubble(ev) {
+  const entry = messageMap[ev.message_id];
+  if (entry) {
+    // Update the bubble text in-place
+    entry.bubble.innerHTML = renderText(ev.text) + `<div class="ts">${ts()} (edited)</div>`;
+
+    // Remove old keyboard if present
+    if (entry.keyboardDiv && entry.keyboardDiv.parentNode) {
+      entry.keyboardDiv.parentNode.removeChild(entry.keyboardDiv);
+      entry.keyboardDiv = null;
+    }
+
+    // Add new keyboard if present
+    if (ev.reply_markup && ev.reply_markup.inline_keyboard) {
+      const kd = renderKeyboard(ev.reply_markup.inline_keyboard, ev.message_id);
+      entry.content.appendChild(kd);
+      entry.keyboardDiv = kd;
+    }
+
+    messageMap[ev.message_id] = entry;
+  } else {
+    // Message not tracked (e.g. edited before we saw it) — add as new
+    addBotBubble(ev);
+  }
+  scrollToBottom();
+}
+
+function editKeyboard(ev) {
+  const entry = messageMap[ev.message_id];
+  if (!entry) return;
+
+  if (entry.keyboardDiv && entry.keyboardDiv.parentNode) {
+    entry.keyboardDiv.parentNode.removeChild(entry.keyboardDiv);
+    entry.keyboardDiv = null;
+  }
+
+  if (ev.reply_markup && ev.reply_markup.inline_keyboard) {
+    const kd = renderKeyboard(ev.reply_markup.inline_keyboard, ev.message_id);
+    entry.content.appendChild(kd);
+    entry.keyboardDiv = kd;
+    messageMap[ev.message_id].keyboardDiv = kd;
+  }
+}
+
+function disableKeyboard(messageId) {
+  const entry = messageMap[messageId];
+  if (!entry || !entry.keyboardDiv) return;
+  entry.keyboardDiv.querySelectorAll('.kb-btn').forEach(b => b.disabled = true);
+}
+
+function addDocumentBubble(ev) {
+  const messages = document.getElementById('messages');
+  const row = document.createElement('div');
+  row.className = 'bubble-row bot';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = '🤖';
+
+  const content = document.createElement('div');
+  content.className = 'bubble-content';
+
+  const ext = (ev.filename || '').split('.').pop().toLowerCase();
+  const fileIcon = ext === 'pdf' ? '📕' : ext === 'docx' || ext === 'doc' ? '📘' : '📎';
+  const sizeStr = ev.file_size > 0 ? formatSize(ev.file_size) : '';
+
+  const card = document.createElement('a');
+  card.className = 'file-card';
+  card.href = ev.download_url;
+  card.download = ev.filename;
+  card.target = '_blank';
+  card.innerHTML = `
+    <div class="file-icon">${fileIcon}</div>
+    <div class="file-info">
+      <div class="file-name">${escapeHtml(ev.filename)}</div>
+      <div class="file-meta">${ev.caption ? escapeHtml(ev.caption) + ' · ' : ''}${sizeStr}</div>
+    </div>
+    <div class="dl-icon">⬇</div>
+  `;
+  content.appendChild(card);
+
+  const tsDiv = document.createElement('div');
+  tsDiv.style.cssText = 'font-size:10px;color:var(--text-muted);padding:2px 4px';
+  tsDiv.textContent = ts();
+  content.appendChild(tsDiv);
+
+  row.appendChild(avatar);
+  row.appendChild(content);
+  messages.insertBefore(row, document.getElementById('typing'));
+  scrollToBottom();
+}
+
+// ── Keyboard builder ───────────────────────────────────────────────────────
+function renderKeyboard(rows, messageId) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'keyboard';
+  wrapper.dataset.messageId = messageId;
+
+  rows.forEach(rowBtns => {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'keyboard-row';
+
+    rowBtns.forEach(btn => {
+      const el = document.createElement('button');
+      el.className = 'kb-btn';
+      el.textContent = btn.text;
+      el.title = `callback_data: ${btn.callback_data}`;
+      el.onclick = () => {
+        disableKeyboard(messageId);
+        clickButton(btn.callback_data, btn.text, messageId);
+      };
+      rowEl.appendChild(el);
+    });
+
+    wrapper.appendChild(rowEl);
+  });
+
+  return wrapper;
+}
+
+// ── Text rendering (basic Telegram Markdown → HTML) ───────────────────────
+function renderText(raw) {
+  if (!raw) return '';
+  let s = escapeHtml(raw);
+  // Bold: *text*
+  s = s.replace(/\*([^*\n]+)\*/g, '<strong>$1</strong>');
+  // Code: `text`
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  return s;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+// ── Log panel ──────────────────────────────────────────────────────────────
+function addLog(level, message) {
+  const list = document.getElementById('logList');
+  const entry = document.createElement('div');
+  entry.className = `log-entry ${level || 'info'}`;
+  entry.innerHTML = `<span class="log-ts">${ts()}</span><span class="log-msg">${escapeHtml(message)}</span>`;
+  list.appendChild(entry);
+  list.scrollTop = list.scrollHeight;
+}
+
+function clearLogs() {
+  document.getElementById('logList').innerHTML = '';
+}
+
+function clearChat() {
+  const m = document.getElementById('messages');
+  // Remove all children except the typing indicator
+  const typing = document.getElementById('typing');
+  while (m.firstChild) m.removeChild(m.firstChild);
+  m.appendChild(typing);
+  Object.keys(messageMap).forEach(k => delete messageMap[k]);
+}
+
+// ── Send actions ───────────────────────────────────────────────────────────
+async function sendMessage() {
+  const input = document.getElementById('msgInput');
+  const text = input.value.trim();
+  if (!text || !connected) return;
+
+  input.value = '';
+  autoResize(input);
+
+  try {
+    await fetch('/sandbox/send_message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+  } catch (e) {
+    addLog('error', `Failed to send: ${e.message}`);
+  }
+}
+
+async function sendCommand(cmd) {
+  if (!connected) return;
+  try {
+    await fetch('/sandbox/send_command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: cmd }),
+    });
+  } catch (e) {
+    addLog('error', `Failed to send command: ${e.message}`);
+  }
+}
+
+async function clickButton(callbackData, buttonText, messageId) {
+  try {
+    await fetch('/sandbox/click_button', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_data: callbackData, button_text: buttonText, message_id: messageId }),
+    });
+  } catch (e) {
+    addLog('error', `Failed to click button: ${e.message}`);
+  }
+}
+
+// ── Input auto-resize ──────────────────────────────────────────────────────
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+document.getElementById('msgInput').addEventListener('input', function() {
+  autoResize(this);
+});
+
+document.getElementById('msgInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>
