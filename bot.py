@@ -20,13 +20,24 @@ bot.py                  ← start here
 ├── states.py           ← State enum
 └── config.py           ← env vars & paths
 """
+import os
 import logging
+
+# Tell httpx to bypass system proxy (Shadowrocket/VPN HTTP proxy at 1082)
+# for Telegram's API. Shadowrocket TUN mode handles routing at kernel level,
+# so no explicit proxy is needed. Without this, httpx picks up the macOS
+# system proxy and the TLS handshake times out.
+os.environ.setdefault("NO_PROXY", "api.telegram.org")
+
+from telegram import Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -60,6 +71,17 @@ def _allowed(update, ctx) -> bool:
 
 
 TEXT = filters.TEXT & ~filters.COMMAND
+
+
+async def _log_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log every incoming update to the console (group=-1 runs before all other handlers)."""
+    user = update.effective_user
+    user_info = f"{user.full_name} (id={user.id})" if user else "unknown"
+
+    if update.message:
+        logger.info("[MSG] %s → %s", user_info, update.message.text or update.message.document)
+    elif update.callback_query:
+        logger.info("[BTN] %s → %s", user_info, update.callback_query.data)
 
 
 def build_conversation_handler() -> ConversationHandler:
@@ -120,6 +142,7 @@ def main() -> None:
     if PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
     app = builder.build()
+    app.add_handler(TypeHandler(Update, _log_update), group=-1)
     app.add_handler(build_conversation_handler())
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
