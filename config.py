@@ -4,7 +4,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN: str = os.environ["BOT_TOKEN"]
+# Sandbox can run without a real Telegram token
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+if not BOT_TOKEN:
+    if os.getenv('SANDBOX_MODE') or os.getenv('SANDBOX_STANDALONE'):
+        BOT_TOKEN = 'sandbox'
+    else:
+        raise ValueError('BOT_TOKEN is required when not in SANDBOX_MODE or SANDBOX_STANDALONE')
 
 # Optional: restrict bot to specific Telegram user IDs
 _raw = os.getenv("ALLOWED_USER_IDS", "")

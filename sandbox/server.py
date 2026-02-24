@@ -1,15 +1,12 @@
 """
 Sandbox server for local bot testing without Telegram.
 
-Acts as a fake Telegram Bot API + serves a web UI via WebSocket.
-
-Start the full sandbox with:
-    # Terminal 1 – fake API + UI server
-    cd ship-visa-bot
-    python -m sandbox.server
-
-    # Terminal 2 – bot pointed at sandbox
-    SANDBOX_MODE=1 python bot.py
+Two modes:
+  1. With bot process (two terminals):
+     Terminal 1: python -m sandbox.server
+     Terminal 2: SANDBOX_MODE=1 python bot.py
+  2. Standalone (one process, no Telegram):
+     SANDBOX_STANDALONE=1 python -m sandbox.server
 
 Then open http://localhost:8888 in your browser.
 """
@@ -18,8 +15,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,14 +38,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sandbox")
 
-# ── App & shared state ────────────────────────────────────────────────────────
-app = FastAPI(title="Bot Sandbox")
+# ── Shared state ──────────────────────────────────────────────────────────────
+# asyncio.Queue must be created inside the running event loop (Python 3.9
+# compatibility — Queue captured the loop at construction time in 3.9).
+# We initialise it in the lifespan handler, not at import time.
+_update_queue: Optional[asyncio.Queue] = None
 
-_update_queue: asyncio.Queue = asyncio.Queue()
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    global _update_queue, _bot_connected
+    _update_queue = asyncio.Queue()
+    if os.getenv('SANDBOX_STANDALONE'):
+        _bot_connected = True
+        logger.info('[SANDBOX] standalone mode — brain runs in-process')
+    yield
+
+
+app = FastAPI(title="Bot Sandbox", lifespan=_lifespan)
 _update_counter: int = 1
 _ws_clients: List[WebSocket] = []
 _files: Dict[str, str] = {}          # file_id → local path
 _message_counter: int = 1000         # fake message_id counter
+_bot_connected: bool = False         # True once the bot calls getMe
+_standalone_last_message_id: Optional[int] = None  # for EditMessage in standalone mode
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -62,6 +77,40 @@ def _next_mid() -> int:
     v = _message_counter
     _message_counter += 1
     return v
+
+
+async def _parse_body(request: Request) -> Dict:
+    """Parse a Telegram Bot API request body.
+
+    python-telegram-bot v21 sends ALL non-file requests as
+    application/x-www-form-urlencoded, not JSON.  Nested objects
+    (reply_markup, allowed_updates …) are JSON-encoded strings inside
+    the form fields, so we decode those too.
+    """
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            return await request.json()
+        except Exception:
+            return {}
+
+    # URL-encoded form body (PTB default)
+    try:
+        form = await request.form()
+    except Exception:
+        return {}
+
+    result: Dict = {}
+    for k, v in form.items():
+        # Decode JSON-encoded values (dicts, lists)
+        if isinstance(v, str) and v and v[0] in ("{", "["):
+            try:
+                result[k] = json.loads(v)
+                continue
+            except json.JSONDecodeError:
+                pass
+        result[k] = v
+    return result
 
 
 async def _broadcast(event: Dict[str, Any]) -> None:
@@ -128,10 +177,39 @@ def _make_callback_update(callback_data: str, orig_message_id: int) -> Dict:
     }
 
 
+def _make_document_update(file_id: str, filename: str, file_size: int) -> Dict:
+    """Fake update: user sent a document (e.g. from URL)."""
+    return {
+        "update_id": _next_uid(),
+        "message": {
+            "message_id": _next_mid(),
+            "from": _fake_user(),
+            "chat": _fake_chat(),
+            "date": int(time.time()),
+            "document": {
+                "file_id": file_id,
+                "file_unique_id": file_id,
+                "file_name": filename,
+                "file_size": file_size,
+            },
+        },
+    }
+
+
 # ── Fake Telegram Bot API ─────────────────────────────────────────────────────
+
+async def _mark_bot_connected() -> None:
+    global _bot_connected
+    if not _bot_connected:
+        _bot_connected = True
+        logger.info("[SANDBOX] bot connected")
+        await _broadcast({"type": "bot_status", "online": True})
+        await _broadcast({"type": "log", "level": "success", "message": "🤖 Bot connected to sandbox"})
+
 
 @app.api_route("/bot{token}/getMe", methods=["GET", "POST"])
 async def get_me(token: str):
+    await _mark_bot_connected()
     return {
         "ok": True,
         "result": {
@@ -164,13 +242,8 @@ async def set_my_commands(token: str):
 @app.api_route("/bot{token}/getUpdates", methods=["GET", "POST"])
 async def get_updates(token: str, request: Request):
     """Long-polling endpoint — blocks until an update is available or timeout expires."""
-    body: Dict = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-
-    timeout = max(float(body.get("timeout", 0)), 0.3)
+    body = await _parse_body(request)
+    timeout = max(float(body.get("timeout", 0)), 1.0)
 
     try:
         update = await asyncio.wait_for(_update_queue.get(), timeout=timeout)
@@ -186,7 +259,7 @@ async def get_updates(token: str, request: Request):
 
 @app.api_route("/bot{token}/sendMessage", methods=["GET", "POST"])
 async def send_message(token: str, request: Request):
-    body = await request.json()
+    body = await _parse_body(request)
     text = body.get("text", "")
     reply_markup = body.get("reply_markup")  # dict or None
     mid = _next_mid()
@@ -217,12 +290,7 @@ async def send_message(token: str, request: Request):
 
 @app.api_route("/bot{token}/editMessageText", methods=["GET", "POST"])
 async def edit_message_text(token: str, request: Request):
-    body: Dict = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-
+    body = await _parse_body(request)
     text = body.get("text", "")
     mid = body.get("message_id", _next_mid())
     reply_markup = body.get("reply_markup")
@@ -343,6 +411,82 @@ async def get_file(token: str, request: Request):
     return {"ok": True, "result": {"file_id": fid, "file_unique_id": fid, "file_size": 0, "file_path": f"documents/{fid}"}}
 
 
+# ── Standalone: run brain in-process (no bot process) ────────────────────────
+def _run_standalone_brain(event: Dict) -> List[Any]:
+    """Call the core brain and return list of response objects."""
+    from core.brain import process
+    return process(FAKE_CHAT_ID, event)
+
+
+async def _apply_standalone_responses(
+    responses: List[Any],
+    callback_message_id: Optional[int] = None,
+) -> None:
+    """Broadcast brain responses to WebSocket clients."""
+    global _standalone_last_message_id
+    edit_mid = callback_message_id
+    for r in responses:
+        rtype = type(r).__name__
+        if rtype == 'AnswerCallback':
+            continue
+        if rtype == 'ReplyText':
+            mid = _next_mid()
+            _standalone_last_message_id = mid
+            rm = getattr(r, 'reply_markup', None)
+            await _broadcast({
+                'type': 'bot_message',
+                'message_id': mid,
+                'text': r.text,
+                'parse_mode': getattr(r, 'parse_mode', '') or '',
+                'reply_markup': {'inline_keyboard': rm} if rm else None,
+            })
+            await _broadcast({
+                'type': 'log',
+                'level': 'success',
+                'message': f"🤖 → {r.text[:80]}{'…' if len(r.text) > 80 else ''}",
+            })
+            continue
+        if rtype == 'EditMessage':
+            mid = getattr(r, 'message_id', None) or edit_mid or _standalone_last_message_id
+            if mid is not None:
+                rm = getattr(r, 'reply_markup', None)
+                await _broadcast({
+                    'type': 'bot_edit_message',
+                    'message_id': mid,
+                    'text': r.text,
+                    'parse_mode': getattr(r, 'parse_mode', '') or '',
+                    'reply_markup': {'inline_keyboard': rm} if rm else None,
+                })
+                await _broadcast({
+                    'type': 'log',
+                    'level': 'success',
+                    'message': f"🤖 (edit) → {r.text[:80]}{'…' if len(r.text) > 80 else ''}",
+                })
+            if edit_mid is not None:
+                edit_mid = None
+            continue
+        if rtype == 'SendDocument':
+            file_id = str(uuid.uuid4())
+            src = getattr(r, 'file_path', '')
+            filename = getattr(r, 'filename', 'document')
+            if os.path.exists(src):
+                dest = f'/tmp/sandbox_{file_id}_{filename}'
+                shutil.copy2(src, dest)
+                _files[file_id] = dest
+            mid = _next_mid()
+            download_url = f'/sandbox/download/{file_id}/{filename}'
+            await _broadcast({
+                'type': 'bot_document',
+                'message_id': mid,
+                'filename': filename,
+                'caption': getattr(r, 'caption', '') or '',
+                'file_id': file_id,
+                'file_size': os.path.getsize(src) if os.path.exists(src) else 0,
+                'download_url': download_url,
+            })
+            await _broadcast({'type': 'log', 'level': 'success', 'message': f'📄 → {filename}'})
+
+
 # ── Sandbox control endpoints (called by the web UI) ─────────────────────────
 
 @app.post("/sandbox/send_message")
@@ -352,11 +496,17 @@ async def sandbox_send_message(request: Request):
     if not text:
         return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
 
-    update = _make_message_update(text)
-    await _update_queue.put(update)
-
     await _broadcast({"type": "user_message", "text": text})
     await _broadcast({"type": "log", "level": "info", "message": f"👤 User → {text}"})
+
+    if os.getenv("SANDBOX_STANDALONE"):
+        event = {"type": "message", "text": text}
+        responses = _run_standalone_brain(event)
+        await _apply_standalone_responses(responses)
+    else:
+        update = _make_message_update(text)
+        await _update_queue.put(update)
+
     return {"ok": True}
 
 
@@ -365,11 +515,17 @@ async def sandbox_send_command(request: Request):
     body = await request.json()
     cmd = body.get("command", "/start")
 
-    update = _make_message_update(cmd)
-    await _update_queue.put(update)
-
     await _broadcast({"type": "user_message", "text": cmd, "is_command": True})
     await _broadcast({"type": "log", "level": "info", "message": f"⚡ Command → {cmd}"})
+
+    if os.getenv("SANDBOX_STANDALONE"):
+        event = {"type": "message", "text": cmd}
+        responses = _run_standalone_brain(event)
+        await _apply_standalone_responses(responses)
+    else:
+        update = _make_message_update(cmd)
+        await _update_queue.put(update)
+
     return {"ok": True}
 
 
@@ -380,12 +536,64 @@ async def sandbox_click_button(request: Request):
     button_text: str = body.get("button_text", callback_data)
     orig_message_id: int = body.get("message_id", _message_counter)
 
-    update = _make_callback_update(callback_data, orig_message_id)
-    await _update_queue.put(update)
-
     await _broadcast({"type": "user_button_click", "button_text": button_text, "callback_data": callback_data})
     await _broadcast({"type": "log", "level": "info", "message": f"🔘 Button → [{button_text}] data={callback_data}"})
+
+    if os.getenv("SANDBOX_STANDALONE"):
+        event = {"type": "callback", "data": callback_data, "message_id": orig_message_id}
+        responses = _run_standalone_brain(event)
+        await _apply_standalone_responses(responses, callback_message_id=orig_message_id)
+    else:
+        update = _make_callback_update(callback_data, orig_message_id)
+        await _update_queue.put(update)
+
     return {"ok": True}
+
+
+@app.post("/sandbox/send_document")
+async def sandbox_send_document(request: Request):
+    """Simulate user sending a file (e.g. from URL). Body: {"url": "https://..."} or {"filename": "x.pdf"}."""
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    filename = (body.get("filename") or "").strip() or "document.pdf"
+
+    if not url:
+        return JSONResponse({"ok": False, "error": "url required"}, status_code=400)
+
+    file_id = str(uuid.uuid4())
+    file_size = 0
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "SandboxBot/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read()
+            file_size = len(content)
+            name_from_url = url.split("/")[-1].split("?")[0]
+            if name_from_url:
+                filename = name_from_url
+            dest = f"/tmp/sandbox_{file_id}_{filename}"
+            with open(dest, "wb") as f:
+                f.write(content)
+            _files[file_id] = dest
+    except Exception as e:
+        logger.warning("[SANDBOX] send_document URL fetch failed: %s", e)
+        filename = filename or "document"
+
+    await _broadcast({"type": "user_message", "text": f"📎 File: {filename}", "is_file": True})
+    await _broadcast({"type": "log", "level": "info", "message": f"📎 User → file: {filename}"})
+
+    if os.getenv("SANDBOX_STANDALONE"):
+        await _broadcast({
+            "type": "bot_message",
+            "message_id": _next_mid(),
+            "text": "دریافت فایل در این ربات در حال حاضر پشتیبانی نمی‌شود. لطفاً از متن و دکمه‌ها استفاده کنید.",
+        })
+        await _broadcast({"type": "log", "level": "success", "message": "🤖 → (file not handled in flow)"})
+    else:
+        update = _make_document_update(file_id, filename, file_size)
+        await _update_queue.put(update)
+
+    return {"ok": True, "file_id": file_id, "filename": filename}
 
 
 @app.post("/sandbox/clear_queue")
@@ -422,6 +630,8 @@ async def ws_endpoint(ws: WebSocket):
         "message": "🟢 Sandbox ready — click /start to begin",
     }))
     await ws.send_text(json.dumps({"type": "connected"}))
+    # Tell the new client the current bot connection state
+    await ws.send_text(json.dumps({"type": "bot_status", "online": _bot_connected}))
 
     try:
         while True:

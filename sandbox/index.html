@@ -94,6 +94,17 @@
     transition: background .15s, border-color .15s;
   }
   .cmd-btn:hover { background: var(--border); border-color: var(--accent); }
+  .file-url-input {
+    width: 160px;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 12px;
+  }
+  .file-url-input::placeholder { color: var(--text-muted); }
+  .file-url-input:focus { outline: none; border-color: var(--accent); }
 
   .messages {
     flex: 1;
@@ -316,6 +327,9 @@
   <div class="spacer"></div>
   <div class="status-dot" id="statusDot"></div>
   <div class="status-label" id="statusLabel">Connecting…</div>
+  <div style="width:1px;height:20px;background:var(--border);margin:0 4px"></div>
+  <div class="status-dot" id="botDot" style="background:#888"></div>
+  <div class="status-label" id="botLabel">Bot: waiting</div>
 </header>
 
 <!-- ── Main ─────────────────────────────────────────────────────────────────── -->
@@ -328,6 +342,8 @@
       <button class="cmd-btn" onclick="sendCommand('/start')">⟳ /start</button>
       <button class="cmd-btn" onclick="sendCommand('/cancel')">✕ /cancel</button>
       <div style="flex:1"></div>
+      <input type="text" id="fileUrlInput" placeholder="File URL…" class="file-url-input" />
+      <button class="cmd-btn" onclick="sendFileUrl()" title="Send file from URL">📎 Send file</button>
       <button class="cmd-btn" onclick="clearChat()" title="Clear chat history">🗑 Clear chat</button>
     </div>
 
@@ -394,13 +410,22 @@ function setStatus(online) {
   document.getElementById('sendBtn').disabled = !online;
 }
 
+function setBotStatus(online) {
+  document.getElementById('botDot').className = 'status-dot ' + (online ? 'online' : 'offline');
+  document.getElementById('botLabel').textContent = online ? 'Bot: ready' : 'Bot: not running';
+  if (!online) {
+    addLog('error', '⚠️ Bot not connected — run:  python -m sandbox.run  or  SANDBOX_WITH_BOT=1 python -m sandbox.run');
+  }
+}
+
 // ── Event router ───────────────────────────────────────────────────────────
 function handleEvent(ev) {
   switch (ev.type) {
     case 'connected':      break;
+    case 'bot_status':     setBotStatus(ev.online); break;
     case 'log':            addLog(ev.level, ev.message); break;
     case 'user_message':   addUserBubble(ev.text, ev.is_command); break;
-    case 'user_button_click': addUserBubble(`[${ev.button_text}]`, false, true); break;
+    case 'user_button_click': addUserBubble(ev.button_text || ev.callback_data || '', false, true); break;
     case 'bot_message':    addBotBubble(ev); break;
     case 'bot_edit_message': editBotBubble(ev); break;
     case 'bot_edit_keyboard': editKeyboard(ev); break;
@@ -479,25 +504,16 @@ function addBotBubble(ev) {
 function editBotBubble(ev) {
   const entry = messageMap[ev.message_id];
   if (entry) {
-    // Update the bubble text in-place
-    entry.bubble.innerHTML = renderText(ev.text) + `<div class="ts">${ts()} (edited)</div>`;
-
-    // Remove old keyboard if present
+    // After a button click, show reply below the user's choice: remove keyboard from old
+    // message and add the new content as a new bot bubble at the end (correct order).
     if (entry.keyboardDiv && entry.keyboardDiv.parentNode) {
       entry.keyboardDiv.parentNode.removeChild(entry.keyboardDiv);
       entry.keyboardDiv = null;
     }
-
-    // Add new keyboard if present
-    if (ev.reply_markup && ev.reply_markup.inline_keyboard) {
-      const kd = renderKeyboard(ev.reply_markup.inline_keyboard, ev.message_id);
-      entry.content.appendChild(kd);
-      entry.keyboardDiv = kd;
-    }
-
-    messageMap[ev.message_id] = entry;
+    // Use a new message_id so the new bubble is tracked separately
+    const newEv = { ...ev, message_id: ev.message_id + 900000 };
+    addBotBubble(newEv);
   } else {
-    // Message not tracked (e.g. edited before we saw it) — add as new
     addBotBubble(ev);
   }
   scrollToBottom();
@@ -685,6 +701,22 @@ async function clickButton(callbackData, buttonText, messageId) {
     });
   } catch (e) {
     addLog('error', `Failed to click button: ${e.message}`);
+  }
+}
+
+async function sendFileUrl() {
+  const input = document.getElementById('fileUrlInput');
+  const url = (input && input.value) ? input.value.trim() : '';
+  if (!url || !connected) return;
+  if (input) input.value = '';
+  try {
+    await fetch('/sandbox/send_document', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url || undefined, filename: url ? undefined : 'document.pdf' }),
+    });
+  } catch (e) {
+    addLog('error', `Failed to send file: ${e.message}`);
   }
 }
 

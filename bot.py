@@ -2,161 +2,144 @@
 Entry point for the Ship Visa Telegram Bot.
 
 Architecture
-─────────────
-bot.py                  ← start here
-├── handlers/
-│   ├── start.py        ← /start, visa type selection
-│   ├── ship.py         ← ship & routing info collection
-│   ├── crew.py         ← crew member loop
-│   └── confirm.py      ← summary + document generation
-├── documents/
-│   ├── generator.py    ← docxtpl Word + LibreOffice PDF
-│   └── create_template.py  ← one-time template builder
-├── utils/
-│   ├── keyboards.py    ← InlineKeyboard factories
-│   └── messages.py     ← all user-facing strings
-├── models.py           ← VisaSession, ShipDetails, CrewMember …
-├── session_manager.py  ← in-memory chat state store
-├── states.py           ← State enum
-└── config.py           ← env vars & paths
+────────────
+- core/brain.py   → business logic (state machine, session, responses). UI-agnostic.
+- bot.py          → Telegram adapter: receives updates, calls brain, sends responses.
+- sandbox/server  → sandbox adapter: can run brain in-process or proxy to bot.
 """
 import os
 import logging
 
-# Tell httpx to bypass system proxy (Shadowrocket/VPN HTTP proxy at 1082)
-# for Telegram's API. Shadowrocket TUN mode handles routing at kernel level,
-# so no explicit proxy is needed. Without this, httpx picks up the macOS
-# system proxy and the TLS handshake times out.
-os.environ.setdefault("NO_PROXY", "api.telegram.org")
+os.environ.setdefault('NO_PROXY', 'api.telegram.org')
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    TypeHandler,
-    filters,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, ContextTypes, TypeHandler
 
 from config import BOT_TOKEN, ALLOWED_USER_IDS, PROXY_URL
-from states import State
-from handlers.start import start, handle_visa_type
-from handlers.ship import (
-    ship_name, ship_owner, ship_imo, ship_reg_date,
-    routing_origin, routing_destination,
-)
-from handlers.crew import (
-    crew_fullname, crew_passport, crew_passport_expiry,
-    crew_cdc, crew_cdc_expiry, crew_gender, crew_dob,
-    crew_rank, add_more_crew,
-)
-from handlers.confirm import handle_confirmation
-from utils.messages import CANCELLED
+from core.brain import process
+from core.responses import ReplyText, EditMessage, SendDocument, AnswerCallback
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 
-# ── Access control (optional) ─────────────────────────────────────────────────
-def _allowed(update, ctx) -> bool:
+def _allowed(update: Update) -> bool:
     if not ALLOWED_USER_IDS:
         return True
     return update.effective_user.id in ALLOWED_USER_IDS
 
 
-TEXT = filters.TEXT & ~filters.COMMAND
+def _to_markup(rows):
+    """Convert core keyboard (list of list of {text, callback_data}) to InlineKeyboardMarkup."""
+    if not rows:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(b['text'], callback_data=b['callback_data']) for b in row]
+        for row in rows
+    ])
 
 
-async def _log_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log every incoming update to the console (group=-1 runs before all other handlers)."""
-    user = update.effective_user
-    user_info = f"{user.full_name} (id={user.id})" if user else "unknown"
-
+def _update_to_event(update: Update):
+    """Turn a Telegram Update into a brain event (message or callback)."""
     if update.message:
-        logger.info("[MSG] %s → %s", user_info, update.message.text or update.message.document)
+        return {'type': 'message', 'text': (update.message.text or '')}
+    if update.callback_query:
+        return {
+            'type': 'callback',
+            'data': update.callback_query.data or '',
+            'message_id': update.callback_query.message.message_id,
+        }
+    return None
+
+
+async def _handle_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Single handler: delegate to brain and apply responses to Telegram."""
+    if not _allowed(update):
+        return
+
+    user = update.effective_user
+    user_info = f'{user.full_name} (id={user.id})' if user else 'unknown'
+    if update.message:
+        logger.info('[MSG] %s → %s', user_info, update.message.text or update.message.document)
     elif update.callback_query:
-        logger.info("[BTN] %s → %s", user_info, update.callback_query.data)
+        logger.info('[BTN] %s → %s', user_info, update.callback_query.data)
 
+    event = _update_to_event(update)
+    if not event:
+        return
 
-def build_conversation_handler() -> ConversationHandler:
-    """
-    Single ConversationHandler that covers the entire wizard.
-    Adding a new step = add a new State + handler here.
-    """
-    return ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            State.VISA_TYPE: [
-                CallbackQueryHandler(handle_visa_type, pattern=r"^visa_type:")
-            ],
-            # ── Ship info ──────────────────────────────────────────────────
-            State.SHIP_NAME: [MessageHandler(TEXT, ship_name)],
-            State.SHIP_OWNER: [MessageHandler(TEXT, ship_owner)],
-            State.SHIP_IMO: [MessageHandler(TEXT, ship_imo)],
-            State.SHIP_REG_DATE: [MessageHandler(TEXT, ship_reg_date)],
-            # ── Routing ────────────────────────────────────────────────────
-            State.ORIGIN: [MessageHandler(TEXT, routing_origin)],
-            State.DESTINATION: [MessageHandler(TEXT, routing_destination)],
-            # ── Crew loop ──────────────────────────────────────────────────
-            State.CREW_FULLNAME: [MessageHandler(TEXT, crew_fullname)],
-            State.CREW_PASSPORT: [MessageHandler(TEXT, crew_passport)],
-            State.CREW_PASSPORT_EXPIRY: [MessageHandler(TEXT, crew_passport_expiry)],
-            State.CREW_CDC: [MessageHandler(TEXT, crew_cdc)],
-            State.CREW_CDC_EXPIRY: [MessageHandler(TEXT, crew_cdc_expiry)],
-            State.CREW_GENDER: [
-                CallbackQueryHandler(crew_gender, pattern=r"^gender:")
-            ],
-            State.CREW_DOB: [MessageHandler(TEXT, crew_dob)],
-            State.CREW_RANK: [MessageHandler(TEXT, crew_rank)],
-            State.ADD_MORE_CREW: [
-                CallbackQueryHandler(add_more_crew, pattern=r"^more_crew:")
-            ],
-            # ── Confirmation ───────────────────────────────────────────────
-            State.CONFIRM: [
-                CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:")
-            ],
-        },
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", _cancel),
-        ],
-        # Re-raise exceptions so they are visible in logs
-        # allow_reentry=True lets users restart mid-flow via /start
-        allow_reentry=True,
-    )
+    chat_id = update.effective_chat.id
+    callback_message_id = None
+    if update.callback_query:
+        callback_message_id = update.callback_query.message.message_id
 
+    responses = process(chat_id, event)
 
-async def _cancel(update, ctx) -> int:
-    await update.message.reply_text(CANCELLED)
-    return ConversationHandler.END
+    for r in responses:
+        if isinstance(r, AnswerCallback):
+            if update.callback_query:
+                await update.callback_query.answer()
+            continue
+        if isinstance(r, ReplyText):
+            await ctx.bot.send_message(
+                chat_id,
+                r.text,
+                parse_mode=r.parse_mode or None,
+                reply_markup=_to_markup(r.reply_markup),
+            )
+            continue
+        if isinstance(r, EditMessage):
+            mid = r.message_id or callback_message_id
+            if mid is not None:
+                await ctx.bot.edit_message_text(
+                    r.text,
+                    chat_id=chat_id,
+                    message_id=mid,
+                    parse_mode=r.parse_mode or None,
+                    reply_markup=_to_markup(r.reply_markup),
+                )
+            else:
+                await ctx.bot.send_message(
+                    chat_id,
+                    r.text,
+                    parse_mode=r.parse_mode or None,
+                    reply_markup=_to_markup(r.reply_markup),
+                )
+            continue
+        if isinstance(r, SendDocument):
+            with open(r.file_path, 'rb') as f:
+                await ctx.bot.send_document(
+                    chat_id,
+                    document=f,
+                    filename=r.filename,
+                    caption=r.caption or None,
+                )
+            continue
 
 
 def main() -> None:
-    builder = Application.builder().token(BOT_TOKEN)
+    sandbox_mode = os.getenv('SANDBOX_MODE')
+    token = os.getenv('BOT_TOKEN', 'sandbox') if sandbox_mode else BOT_TOKEN
+    builder = Application.builder().token(token)
 
-    sandbox_mode = os.getenv("SANDBOX_MODE")
-    sandbox_port = os.getenv("SANDBOX_PORT", "8888")
+    sandbox_port = os.getenv('SANDBOX_PORT', '8888')
 
     if sandbox_mode:
-        base = f"http://127.0.0.1:{sandbox_port}/bot"
-        builder = builder.base_url(base).base_file_url(f"http://127.0.0.1:{sandbox_port}/file/bot")
-        logger.info("🔧 SANDBOX MODE – fake API at %s", base)
+        base = f'http://127.0.0.1:{sandbox_port}/bot'
+        builder = builder.base_url(base).base_file_url(f'http://127.0.0.1:{sandbox_port}/file/bot')
+        logger.info('🔧 SANDBOX MODE – fake API at %s', base)
     elif PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
 
     app = builder.build()
-    app.add_handler(TypeHandler(Update, _log_update), group=-1)
-    app.add_handler(build_conversation_handler())
+    app.add_handler(TypeHandler(Update, _handle_update))
 
-    logger.info("Bot is running. Press Ctrl+C to stop.")
+    logger.info('Bot is running. Press Ctrl+C to stop.')
     app.run_polling(drop_pending_updates=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
